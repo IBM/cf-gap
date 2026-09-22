@@ -1,78 +1,89 @@
-<!-- This should be the location of the title of the repository, normally the short name -->
-# repo-template
+# Coarse-to-Fine Glimpse-based Active Perception (CF-GAP)
 
-<!-- Build Status, is a great thing to have at the top of your repository, it shows that you take your CI/CD as first class citizens -->
-<!-- [![Build Status](https://travis-ci.org/jjasghar/ibm-cloud-cli.svg?branch=master)](https://travis-ci.org/jjasghar/ibm-cloud-cli) -->
+Official implementation of the ECCV 2026 paper
+**[Task-driven Processing with Coarse-to-Fine Glimpse-based Active Perception](https://media.eventhosts.cc/Conferences/ECCV2026/pdfs/14294.pdf)**
+by Oleh Kolner, Thomas Ortner, Stanisław Woźniak, and Angeliki Pantazi.
 
-<!-- Not always needed, but a scope helps the user understand in a short sentance like below, why this repo exists -->
-## Scope
+## Overview
 
-The purpose of this project is to provide a template for new open source repositories.
+CF-GAP is a **task-driven front-end** that wraps an existing instance detector and feeds it only
+the task-relevant regions at full resolution. Given a scene and a few masked example views of
+a search target, it:
 
-<!-- A more detailed Usage or detailed explaination of the repository here -->
-## Usage
+1. **Builds a coarse priority map** over a downsampled scene to rank where the target is likely to
+   be — `coarse_map.py` (`CoarseSearchMapGeneration`, MobileNetV3 backbone).
+2. **Refines each coarse glimpse with fine, log-polar glimpses** that iteratively re-center on the
+   target — `fine_glimpsing/` (`LogPolarSensor` + a learned `FineSearchMapGeneration`, weights in
+   `fine_search_map_checkpoint.pt`).
+3. **Runs a swappable downstream detector** at high resolution on the attended region —
+   `downstream_architectures.py`.
+4. **Applies inhibition-of-return** to suppress visited regions and move on —
+   `IoRMasker` in `coarse_map.py`.
 
-This repository contains some example best practices for open source repositories:
+The full loop is orchestrated by `CoarseToFineGAP` in [coarse_to_fine_gap.py](coarse_to_fine_gap.py).
+Acting purely as a front-end, CF-GAP improves Average Precision by **up to ~20%** across several
+state-of-the-art instance detectors on the **HR-InsDet** and **Robotools** benchmarks, letting
+lightweight detectors rival much larger ones.
 
-* [LICENSE](LICENSE)
-* [README.md](README.md)
-* [CONTRIBUTING.md](CONTRIBUTING.md)
-* [MAINTAINERS.md](MAINTAINERS.md)
-* [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
-<!-- A Changelog allows you to track major changes and things that happen, https://github.com/github-changelog-generator/github-changelog-generator can help automate the process -->
-* [CHANGELOG.md](CHANGELOG.md)
+## Setup
 
-> These are optional
+The code targets **Python 3.12**. Install the core requirements:
 
-<!-- The following are OPTIONAL, but strongly suggested to have in your repository. -->
-* [dco.yml](.github/dco.yml) - This enables DCO bot for you, please take a look https://github.com/probot/dco for more details.
-* [travis.yml](.travis.yml) - This is a example `.travis.yml`, please take a look https://docs.travis-ci.com/user/tutorial/ for more details.
+```
+pip install -r requirements.txt
+```
 
-These may be copied into a new or existing project to make it easier for developers not on a project team to collaborate.
+Install the downstream architectures you intend to use, following the instructions in their
+original repositories (you only need the ones your chosen configs use):
 
-<!-- A notes section is useful for anything that isn't covered in the Usage or Scope. Like what we have below. -->
-## Notes
+- [GroundingDINO](https://github.com/IDEA-Research/GroundingDINO)
+- [SAM](https://github.com/facebookresearch/segment-anything)
+- [MobileSAM](https://github.com/ChaoningZhang/MobileSAM)
+- [Segment This Thing (STT)](https://github.com/facebookresearch/segment_this_thing)
 
-**NOTE: While this boilerplate project uses the Apache 2.0 license, when
-establishing a new repo using this template, please use the
-license that was approved for your project.**
+[detectron2](https://github.com/facebookresearch/detectron2) is only required to prepare the
+Robotools dataset; it is not needed otherwise. DINOv2, used for feature matching, is downloaded
+automatically via `torch.hub`.
 
-**NOTE: This repository has been configured with the [DCO bot](https://github.com/probot/dco).
-When you set up a new repository that uses the Apache license, you should
-use the DCO to manage contributions. The DCO bot will help enforce that.
-Please contact one of the IBM GH Org stewards.**
+Datasets can be downloaded from their official repositories:
 
-<!-- Questions can be useful but optional, this gives you a place to say, "This is how to contact this project maintainers or create PRs -->
-If you have any questions or issues you can create a new [issue here][issues].
+- [HR-InsDet](https://github.com/insdet/instance-detection)
+- [Robotools](https://github.com/Jaraxxus-Me/VoxDet)
 
-Pull requests are very welcome! Make sure your patches are well tested.
-Ideally create a topic branch for every separate change you make. For
-example:
+Finally, set the dataset and checkpoint paths in [project_definitions.py](project_definitions.py)
+(`DATA_PATH_HR_INSDET`, `DATA_PATH_ROBOTOOLS`, and the per-detector checkpoints/configs). The fine
+search-map checkpoint (`CHECKPOINT_PATH_FINE_SEARCH_MAP`) already points at the bundled
+`fine_search_map_checkpoint.pt`.
 
-1. Fork the repo
-2. Create your feature branch (`git checkout -b my-new-feature`)
-3. Commit your changes (`git commit -am 'Added some feature'`)
-4. Push to the branch (`git push origin my-new-feature`)
-5. Create new Pull Request
+## Running experiments
+
+Each dataset × downstream-detector combination is provided as a standalone config script. Run one
+by executing it with the project root on `PYTHONPATH`, e.g.:
+
+```
+PYTHONPATH=<path/to/this/project> python experiments/hr_insdet/cf_gap_grounding_dino.py
+```
+
+## Demo
+
+The [demo notebook](experiments/demo.ipynb) lets you evaluate single scenes with different configs
+and inspect the coarse-to-fine glimpsing behavior interactively. It runs on a few pre-uploaded samples in
+[experiments/demo_samples/](experiments/demo_samples) and does **not** require installing any of
+the downstream architectures.
+
+## Citation
+
+If you use this code, please cite:
+
+```bibtex
+@inproceedings{kolner2026cfgap,
+  title     = {Task-driven Processing with Coarse-to-Fine Glimpse-based Active Perception},
+  author    = {Kolner, Oleh and Ortner, Thomas and Wo{\'z}niak, Stanis{\l}aw and Pantazi, Angeliki},
+  booktitle = {Proceedings of the European Conference on Computer Vision (ECCV)},
+  year      = {2026},
+}
+```
 
 ## License
 
-All source files must include a Copyright and License header. The SPDX license header is 
-preferred because it can be easily scanned.
-
-If you would like to see the detailed LICENSE click [here](LICENSE).
-
-```text
-#
-# Copyright IBM Corp. {Year project was created} - {Current Year}
-# SPDX-License-Identifier: Apache-2.0
-#
-```
-## Authors
-
-Optionally, you may include a list of authors, though this is redundant with the built-in
-GitHub list of contributors.
-
-- Author: New OpenSource IBMer <new-opensource-ibmer@ibm.com>
-
-[issues]: https://github.com/IBM/repo-template/issues/new
+Released under the OpenMDW License, version 1.0 (OpenMDW-1.0). See [LICENSE](LICENSE).
