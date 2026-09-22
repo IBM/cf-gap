@@ -1,0 +1,9 @@
+kornia
+numpy
+scikit_learn
+torch
+torchmetrics
+torchvision
+pycocotools
+matplotlib
+jupyter

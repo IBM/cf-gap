@@ -1,0 +1,162 @@
+import os.path
+import torchvision
+import torch
+from torch import nn
+
+from coarse_to_fine_gap import CoarseToFineGAP
+from fine_glimpsing.fine_gap import FineGAP
+from fine_glimpsing import fine_search_map
+from fine_glimpsing import basic_modules
+from fine_glimpsing.logpolar_sensor import LogPolarSensor
+from coarse_map import CoarseSearchMapGeneration, IoRMasker
+from fine_glimpsing.target_glimpse_generation import TargetGlimpseExtractor
+from eval_datasets.dataloaders import HRInsDet
+import project_utils
+import project_definitions
+from experiments.evaluation import evaluate
+
+torch.autograd.set_grad_enabled(False)
+
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+seed = 123
+project_utils.set_global_seed(seed)
+
+# TODO: specify the subset of HR-InsDet
+HR_INSDET_SUBSET = 'hard'
+
+SCENE_SIZE = [4096, 5460]
+SEARCH_TARGET_SIZE = 512       # size of search target examples (squared images)
+
+
+def get_dataset():
+    if HR_INSDET_SUBSET == 'small' or HR_INSDET_SUBSET == 'medium' or HR_INSDET_SUBSET == 'large':
+        size_type = HR_INSDET_SUBSET
+        image_dir_name = 'all'
+    else:
+        size_type = None
+        image_dir_name = HR_INSDET_SUBSET
+
+    dataset = HRInsDet(
+        root_dir_scenes=os.path.join(project_definitions.DATA_PATH_HR_INSDET, f'test_set/{image_dir_name}'),
+        root_dir_objects=os.path.join(project_definitions.DATA_PATH_HR_INSDET, 'Objects'),
+        resize_targets=(SEARCH_TARGET_SIZE, SEARCH_TARGET_SIZE),
+        resize=SCENE_SIZE,
+        size_type=size_type,
+        with_names=True
+    )
+    return dataset
+
+
+def get_model(with_downstream_arch=True):
+    # --- Initialize fine search map generator
+    glimpse_size = (245, 245)       # size of log-polar image
+    feat_dim = 96
+    n_feats = 128   # number of vectors in external embeddings
+    h_rho, w_phi = glimpse_size
+    patch_size = 5
+    n_heads = 4
+
+    dummy_input = torch.randn(5, 3, h_rho, w_phi)
+    patch_emb = nn.Conv2d(3, feat_dim, kernel_size=patch_size, stride=patch_size)
+    feature_grid_size = tuple(patch_emb(dummy_input).shape[-2:])
+
+    scene_encoder = basic_modules.BottomUpTopDownAttention(
+        n_feats, feat_dim,
+        bu_attn=basic_modules.CrossAttentionBlock(
+            feat_dim, n_heads, share_norm='qkv'
+        ),
+        td_attn=basic_modules.CrossAttentionBlock(
+            feat_dim, n_heads, share_norm='qkv'
+        ),
+        patch_encoder=patch_emb,
+        feat_self_attention=basic_modules.CrossAttentionBlock(
+            feat_dim, n_heads, share_norm='qkv'
+        ),
+        use_external_features_td_values=True, grid_size=feature_grid_size,
+        max_feat_norm=1.,
+        use_lnorm_external_features=True,
+        use_instance_norm=True
+    )
+    search_target_encoder = scene_encoder
+
+    feature_comparison = fine_search_map.FeatureCorrelator()
+    fine_search_map_generator = fine_search_map.FineSearchMapGeneration(
+        scene_encoder, search_target_encoder, feature_comparison)
+
+    fine_search_map_generator.load_state_dict(torch.load(project_definitions.CHECKPOINT_PATH_FINE_SEARCH_MAP))
+    fine_search_map_generator = fine_search_map.FineSearchMapGenerationWrapper(fine_search_map_generator, every_n_example=4)
+
+    sensor = LogPolarSensor(glimpse_size, radius=2048, skew=1.)
+
+    # radius is smaller since search target images are much smaller (for faster experimentation)
+    search_target_sensor = LogPolarSensor(glimpse_size, radius=512, skew=1.)
+
+    # --- Initialize coarse search map generator
+    pretrained = torchvision.models.mobilenet_v3_large(pretrained=True)
+    pretrained.eval()
+    normalizer = torchvision.transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+
+    downsampling_factor = 0.5
+    coarse_search_map_extractor = CoarseSearchMapGeneration(
+        nn.Sequential(normalizer, nn.Sequential(*list(pretrained.children())[0][:-5]), nn.InstanceNorm2d(112)),
+        norm_type_target='l2',
+        resize_scene=[int(SCENE_SIZE[0] * downsampling_factor), int(SCENE_SIZE[1] * downsampling_factor)],
+    )
+    dummy_map = coarse_search_map_extractor(
+        torch.zeros(1, 3, *SCENE_SIZE), torch.zeros(1, 1, 3, SEARCH_TARGET_SIZE, SEARCH_TARGET_SIZE))
+    coarse_map_size = list(dummy_map.shape[-2:])
+
+    # --- Initialize downstream architecture
+    if with_downstream_arch:
+        import downstream_architectures
+        downstream_architecture = downstream_architectures.NidsNetDownstreamArch(
+            imsize=448,
+            use_adapter=True,
+            adapter_type='weight',
+            adapter_path=project_definitions.CHECKPOINT_PATH_NIDSNET_ADAPTER,
+            device=DEVICE,
+            proposal_ratio=0.25,
+            do_stable_matching=False,
+            score_threshold=-torch.inf,
+            use_sam_boxes=True,
+            min_crop_radius_to_scene_ratio=0.2,
+            output_format='dict',
+            use_mean_loc=True,
+            use_loc_filter=True,
+            gdino_config_path=project_definitions.CONFIG_PATH_GROUNDING_DINO,
+            gdino_checkpoint_path=project_definitions.CHECKPOINT_PATH_GROUNDING_DINO,
+            gdino_box_threshold=0.25,
+            gdino_text_threshold=0.25,
+            sam_vit_model='vit_t',
+            sam_checkpoint_path=project_definitions.CHECKPOINT_PATH_MOBILESAM,
+        )
+    else:
+        downstream_architecture = None
+
+    # --- Initialize fine glimpsing
+    fine_gap = FineGAP(
+        sensor, fine_search_map_generator,
+        n_glimpses=3,
+        temperature=10,
+        downstream_architecture=downstream_architecture,
+    )
+
+    # --- Initialize coarse-to-fine GAP
+    model = CoarseToFineGAP(
+        coarse_map_extractor=coarse_search_map_extractor,
+        n_coarse_glimpses=30,
+        fine_glimpsing=fine_gap,
+        ior_masker=IoRMasker(coarse_map_size, eps=0.5),
+        ior_coarse_glimpses_only=True,
+        search_target_glimpses_extraction=TargetGlimpseExtractor(search_target_sensor, end_with_central_glimpse=True)
+    )
+    model.eval()
+    model.to(DEVICE)
+    return model
+
+
+if __name__ == '__main__':
+    _dataset = get_dataset()
+    _model = get_model()
+    evaluate(_model, _dataset, DEVICE)
